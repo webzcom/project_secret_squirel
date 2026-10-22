@@ -1,10 +1,12 @@
 # PHP2Shell (CVE-2026-109618 / CVE-2026-109619) Mitigation Checklist
 
-As of Oct 21, 2026
+As of Oct 21, 2026 · updated Oct 22, 2026
 
 ## At a glance
 
-Any server running PHP below 8.5.12, 8.4.27, 8.3.36 or 8.2.35 that serves web requests needs attention now. Both CVEs (nicknamed "PHP2Shell") are unauthenticated remote code execution in the PHP engine itself, rated CVSS v4.0 9.2, fixed 21 Oct 2026. A public proof-of-concept has been claimed; no in-the-wild exploitation was reported as of 21 Oct.
+Any server running PHP below 8.5.12, 8.4.27, 8.3.36 or 8.2.35 that serves web requests needs attention now. Both CVEs (nicknamed "PHP2Shell") are unauthenticated remote code execution in the PHP engine itself, rated CVSS v4.0 9.2, fixed 21 Oct 2026.
+
+**Exploitation status (updated 22 Oct):** actively exploited in the wild. watchTowr, Hadrian, Patchstack and Cloudflare report attacks, mostly via the session upload progress path; HKCERT says both CVEs are exploited, and NCSC-NL is investigating first signs of successful misuse. Amazon's honeypots logged a first attempt on 17 Oct, four days before the patch. CISA had not added either CVE to KEV as of 21 Oct.
 
 | CVE | Advisory | Flaw | What goes wrong |
 | --- | --- | --- | --- |
@@ -183,7 +185,7 @@ These break specific confirmed attack paths but do not make a server safe; sched
 
 ## 4. Hunt for compromise
 
-Details leaked on 20 Oct 2026 before the fix, so check exposed servers from that date forward, even after patching. Successful exploitation runs code as the web worker user (e.g. `www-data`, `apache`, `nginx`).
+Attempts were seen as early as 17 Oct 2026, before the fix, so check exposed servers from that date forward, even after patching. Successful exploitation runs code as the web worker user (e.g. `www-data`, `apache`, `nginx`).
 
 - [ ] Search PHP and web logs for bursts of `Allowed memory size ... exhausted`, `Out of memory`, fatal errors or `Maximum execution time exceeded`, especially on POST/multipart requests from a single source.
 
@@ -201,12 +203,57 @@ ps -u www-data,apache,nginx -o pid,ppid,lstart,cmd 2>/dev/null | grep -vE 'php-f
 - [ ] Find recently written PHP files in web roots and temp dirs (webshells):
 
 ```bash
-find /var/www /tmp /var/tmp /dev/shm -type f \( -name '*.php' -o -name '*.phtml' \) -newermt '2026-10-20' 2>/dev/null
+find /var/www /tmp /var/tmp /dev/shm -type f \( -name '*.php' -o -name '*.phtml' -o -name '*.phar' \) -newermt '2026-10-17' 2>/dev/null
 ```
 
 - [ ] Check for new cron entries, SSH keys, or systemd units owned by or writable by the web user.
 - [ ] Review outbound connections from web servers for long-lived sessions or traffic to low-reputation hosts.
 - [ ] Any hit: isolate the host, preserve logs and memory, rotate secrets the web user could read (`.env`, DB credentials, API keys), then rebuild rather than clean.
+
+## 5. Blue Team detection patterns
+
+No atomic IOC list has been published by PHP or Cloudflare, so detect on behavior. Exploitation happens below the application layer, so lean on WAF, proxy, web server and EDR telemetry rather than application logs. No single signal proves exploitation; an OOM error followed by a worker spawning a shell is an incident, an OOM error alone is a lead.
+
+**Request shapes (WAF, proxy, web server)**
+
+Honeypots saw two attack shapes in the first 48 hours: session upload-progress requests and oversized memory-pressure bodies.
+
+| Signal | Targets | Notes |
+| --- | --- | --- |
+| Multipart POST containing a `PHP_SESSION_UPLOAD_PROGRESS` field, with `PHPSESSID` in body or cookie | CVE-2026-109619 (most observed attacks) | Rarely legitimate; any hit deserves review. Requires body inspection. |
+| Multipart POSTs to endpoints that don't take uploads | Both | Baseline which URLs normally receive multipart. |
+| Excessive fields, headers per part, or deeply nested field names (e.g. 20+ levels) | CVE-2026-109618 | Memory-pressure strategy from PHP's advisory. |
+| Missing or malformed `Content-Length`, oversized bodies, long field names, raw null/control bytes | CVE-2026-109618 | |
+| Bursts of near-identical multipart POSTs from one IP with stepped body sizes | Both | Exploits are probabilistic and retry until they hit the right worker; one honeypot source sent 269 requests in a two-minute size sweep. |
+| `p2shell` substring in the Content-Type boundary or a known tool User-Agent | Public tooling | Cheap catch for unmodified tools only. |
+
+- [ ] Enable vendor managed rules where available: AWS WAF PHP rule group v2.3 (`PHP2Shell_BODY`), Azure WAF custom rule for `PHP_SESSION_UPLOAD_PROGRESS`, Cloudflare managed rules, Imunify360 rulesets 8.83+.
+- [ ] Know the gaps: most rules cover only the upload-progress path. Imunify360 says no rule yet blocks the CVE-2026-109618 OOM path, upload-shaped variants can slip through, and on LiteSpeed the WAF can't see the exploit's binary body.
+- [ ] Alert on per-IP bursts of POSTs ending in 413/500/502/503:
+
+```bash
+awk '$6=="\"POST" && $9 ~ /^(413|500|502|503)$/ {print $1}' /var/log/nginx/access.log /var/log/apache2/access.log 2>/dev/null | sort | uniq -c | sort -rn | head -20
+```
+
+**PHP runtime symptoms**
+
+- [ ] OOM errors during request startup, especially while parsing multipart bodies.
+- [ ] Worker crashes: segfaults, exit code 139, FPM `exited on signal 11`, repeated worker restarts, recurring HTTP 500s.
+- [ ] Warnings, deprecations or core errors logged before scripts run (PHP advisory).
+- [ ] Oversized or malformed `PHPSESSID` response cookies, if response headers are logged. Wiz flags this as a sign of the memory-disclosure path; if seen, assume secrets in worker memory leaked.
+
+**Signs of successful compromise (host / EDR)**
+
+- [ ] **Process lineage (highest fidelity):** `apache2`, `httpd`, `php-fpm`, `php-cgi` or `lsphp` spawning `sh`/`bash`/`dash`, `python`/`perl`, `curl`/`wget`, or recon commands (`id`, `whoami`, `uname`).
+- [ ] **Files:** new `.php`, `.phtml` or `.phar` files in upload, cache or web dirs, or files mimicking legitimate names; PHP code inside session files or temp upload files.
+
+```bash
+grep -l '<?php' /var/lib/php/sessions/sess_* 2>/dev/null
+ls -la --time-style=full-iso /tmp/php* 2>/dev/null
+```
+
+- [ ] **Persistence and egress:** new cron entries, SSH keys or systemd units for the web user; unexpected outbound connections; unusual database queries from the web tier.
+- [ ] Correlate: tie request bursts → runtime crashes/OOMs → child processes or new files on the same host and time window before escalating.
 
 ## Sources
 
@@ -221,4 +268,11 @@ find /var/www /tmp /var/tmp /dev/shm -type f \( -name '*.php' -o -name '*.phtml'
 - [Google Cloud / Wiz: affected range back to 5.4](https://cloud.google.com/blog/products/identity-security/responding-to-core-php-vulnerabilities-cve-2026-109618-cve-2026-109619)
 - [Sansec: vulnerable code dates to PHP 5.4.0](https://sansec.io/research/php2shell)
 - [NCSC: assume all PHP versions may be affected](https://www.ncsc.gov.uk/news/critical-security-issue-affecting-php)
-- [watchTowr FAQ: PHP 5 onward reported, no 5.x/7.x patches](https://watchtowr.com/intelligence/php-cve-2026-109618-faq/)
+- [watchTowr FAQ](https://watchtowr.com/intelligence/php-cve-2026-109618-faq/)
+- [Brandefense: exploitation status timeline](https://brandefense.io/blog/php2shell-php-rce-cve-2026-109618-109619/)
+- [OffSeq: first 48 hours on a honeypot fleet](https://offseq.com/en/research/php2shell-first-48-hours/)
+- [Sygnia: monitoring and detection indicators](https://www.sygnia.co/threat-reports-and-advisories/php2shell-two-critical-php-vulnerabilities-expose-web-servers-to-remote-code-execution/)
+- [Beazley Security Labs advisory](https://labs.beazley.security/advisories/BSL-A1233)
+- [AWS WAF mitigations](https://aws.amazon.com/blogs/security/using-aws-waf-to-apply-mitigations-for-php2shell-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619/)
+- [Azure WAF custom rules](https://techcommunity.microsoft.com/blog/azurenetworksecurityblog/azure-waf-custom-rules-for-php2shell-mitigation/4566684)
+- [Imunify360: WAF coverage and gaps](https://blog.imunify360.com/php-cve-2026-109618-cve-2026-109619/)
